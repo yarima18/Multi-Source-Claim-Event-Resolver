@@ -1,0 +1,183 @@
+# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+
+from genlayer import *
+import json
+
+class ClaimResolver(gl.Contract):
+    """
+    Multi-Source Claim / Event Resolver
+
+    Anyone can create a claim with a natural-language question.
+    Multiple evidence URLs can be submitted.
+    The contract fetches the sources live, extracts answers with an LLM,
+    and reaches consensus on TRUE / FALSE / UNDECIDED using the Equivalence Principle.
+    """
+
+    claims: TreeMap[str, str]      # claim_id -> JSON
+    next_id: str
+
+    def __init__(self):
+        self.claims = TreeMap()
+        self.next_id = "0"
+
+    # ──────────────────────────────────────────────
+    # Create a new claim
+    # ──────────────────────────────────────────────
+    @gl.public.write
+    def create_claim(self, question: str) -> str:
+        if len(question.strip()) < 10:
+            raise Exception("Question is too short")
+
+        claim_id = self.next_id
+        self.next_id = str(int(self.next_id) + 1)
+
+        claim = {
+            "creator": str(gl.message.sender_address),
+            "question": question.strip(),
+            "evidence_urls": [],
+            "status": "Open",          # Open → EvidenceSubmitted → Resolved
+            "decision": "",            # TRUE / FALSE / UNDECIDED
+            "reason": "",
+            "sources_summary": ""
+        }
+
+        self.claims[claim_id] = json.dumps(claim, sort_keys=True)
+        return claim_id
+
+    # ──────────────────────────────────────────────
+    # Add evidence URL(s)
+    # ──────────────────────────────────────────────
+    @gl.public.write
+    def add_evidence(self, claim_id: str, evidence_url: str):
+        if claim_id not in self.claims:
+            raise Exception("Claim does not exist")
+
+        claim = json.loads(self.claims[claim_id])
+
+        if claim["status"] not in ("Open", "EvidenceSubmitted"):
+            raise Exception("Claim is already resolved")
+
+        if not evidence_url.startswith("http"):
+            raise Exception("Evidence URL must start with http")
+
+        # Avoid duplicates
+        if evidence_url not in claim["evidence_urls"]:
+            claim["evidence_urls"].append(evidence_url.strip())
+
+        claim["status"] = "EvidenceSubmitted"
+        self.claims[claim_id] = json.dumps(claim, sort_keys=True)
+
+    # ──────────────────────────────────────────────
+    # Resolve the claim (core GenLayer logic)
+    # ──────────────────────────────────────────────
+    @gl.public.write
+    def resolve_claim(self, claim_id: str):
+        if claim_id not in self.claims:
+            raise Exception("Claim does not exist")
+
+        claim = json.loads(self.claims[claim_id])
+
+        if claim["status"] != "EvidenceSubmitted":
+            raise Exception("No evidence has been submitted yet")
+
+        if len(claim["evidence_urls"]) == 0:
+            raise Exception("At least one evidence URL is required")
+
+        question = claim["question"]
+        urls = claim["evidence_urls"][:5]   # limit to 5 sources for safety
+
+        def evaluate():
+            sources_text = ""
+            for i, url in enumerate(urls):
+                try:
+                    content = gl.nondet.web.render(url, mode="text")
+                    content = content[:4000]
+                except Exception as e:
+                    content = f"[Failed to fetch: {str(e)}]"
+                sources_text += f"\n\n=== SOURCE {i+1}: {url} ===\n{content}"
+
+            prompt = f"""
+You are an impartial fact-checker.
+
+CLAIM / QUESTION:
+{question}
+
+LIVE SOURCES:
+{sources_text}
+
+Based only on the sources above, decide the truth of the claim.
+
+Respond ONLY with valid JSON in this exact format:
+{{
+  "decision": "TRUE" or "FALSE" or "UNDECIDED",
+  "reason": "short clear explanation (1-2 sentences)",
+  "sources_summary": "very brief note about what the sources said"
+}}
+
+Rules:
+- TRUE = sources clearly support the claim
+- FALSE = sources clearly contradict the claim
+- UNDECIDED = sources are insufficient, conflicting, or unclear
+- Do not invent information that is not in the sources
+"""
+
+            result = gl.nondet.exec_prompt(prompt, response_format="json")
+            return result
+
+        # Equivalence Principle – decision must match, reason can be similar
+        result = gl.eq_principle.prompt_comparative(
+            evaluate,
+            principle="The 'decision' field must be exactly the same (TRUE, FALSE or UNDECIDED). The 'reason' and 'sources_summary' should convey the same overall judgment."
+        )
+
+        try:
+            if isinstance(result, str):
+                parsed = json.loads(result)
+            else:
+                parsed = result
+
+            decision = str(parsed.get("decision", "UNDECIDED")).upper().strip()
+            reason = str(parsed.get("reason", "No reason provided"))[:400]
+            sources_summary = str(parsed.get("sources_summary", ""))[:300]
+
+            if decision not in ("TRUE", "FALSE", "UNDECIDED"):
+                decision = "UNDECIDED"
+                reason = "Invalid decision format"
+        except Exception:
+            decision = "UNDECIDED"
+            reason = "Failed to parse result"
+            sources_summary = ""
+
+        claim["decision"] = decision
+        claim["reason"] = reason
+        claim["sources_summary"] = sources_summary
+        claim["status"] = "Resolved"
+
+        self.claims[claim_id] = json.dumps(claim, sort_keys=True)
+
+    # ──────────────────────────────────────────────
+    # View methods
+    # ──────────────────────────────────────────────
+    @gl.public.view
+    def get_claim_json(self, claim_id: str) -> str:
+        if claim_id not in self.claims:
+            return "{}"
+        return self.claims[claim_id]
+
+    @gl.public.view
+    def get_status(self, claim_id: str) -> str:
+        if claim_id not in self.claims:
+            return "NotFound"
+        claim = json.loads(self.claims[claim_id])
+        return claim["status"]
+
+    @gl.public.view
+    def get_decision(self, claim_id: str) -> str:
+        if claim_id not in self.claims:
+            return ""
+        claim = json.loads(self.claims[claim_id])
+        return claim.get("decision", "")
+
+    @gl.public.view
+    def get_next_id(self) -> str:
+        return self.next_id
